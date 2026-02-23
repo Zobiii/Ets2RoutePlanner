@@ -4,24 +4,52 @@
 @using Microsoft.EntityFrameworkCore
 
 <h3>Suggest Routes</h3>
-@if (hasUnmapped) { <div class="warn">Some depots are unmapped; results may be incomplete.</div> }
+
+@if (hasUnmapped)
+{
+    <div class="warn">Some depots are unmapped; results may be incomplete.</div>
+}
+
 <div>
     <input list="cities" @bind="start" placeholder="StartCity" />
     <input list="cities" @bind="target" placeholder="TargetCity" />
     <datalist id="cities">
-        @foreach (var c in cities) { <option value="@c"/> }
+        @foreach (var c in cities)
+        {
+            <option value="@c"></option>
+        }
     </datalist>
-    <button @onclick="Suggest">Suggest</button>
+    <button class="btn" @onclick="SuggestAsync">Suggest</button>
 </div>
+
 @if (startHints.Count > 0 || targetHints.Count > 0)
 {
-    <div class="warn">City not found. Start hints: @string.Join(",", startHints) | Target hints: @string.Join(",", targetHints)</div>
+    <div class="warn">
+        City not found exactly.
+        Start hints: @string.Join(", ", startHints)
+        |
+        Target hints: @string.Join(", ", targetHints)
+    </div>
 }
+
 <table>
-<thead><tr><th>StartCompany</th><th>CargoType</th><th>TargetCompany</th></tr></thead>
-<tbody>
-@foreach (var r in rows) { <tr><td>@r.StartCompany</td><td>@r.CargoType</td><td>@r.TargetCompany</td></tr> }
-</tbody>
+    <thead>
+        <tr>
+            <th>StartCompany</th>
+            <th>CargoType</th>
+            <th>TargetCompany</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var r in rows)
+        {
+            <tr>
+                <td>@r.StartCompany</td>
+                <td>@r.CargoType</td>
+                <td>@r.TargetCompany</td>
+            </tr>
+        }
+    </tbody>
 </table>
 
 @code {
@@ -35,12 +63,26 @@
 
     protected override async Task OnInitializedAsync()
     {
-        cities = await Db.Cities.Select(x => x.Name).OrderBy(x => x).ToListAsync();
-        hasUnmapped = await Db.Companies.AnyAsync(x => x.IsUnmapped);
+        await ReloadDataAsync();
     }
 
-    private async Task Suggest()
+    private async Task ReloadDataAsync()
     {
+        cities = await Db.Cities
+            .AsNoTracking()
+            .Select(x => x.Name)
+            .OrderBy(x => x)
+            .ToListAsync();
+
+        hasUnmapped = await Db.Companies
+            .AsNoTracking()
+            .AnyAsync(x => x.IsUnmapped);
+    }
+
+    private async Task SuggestAsync()
+    {
+        await ReloadDataAsync();
+
         var result = await Service.SuggestAsync(start, target);
         rows = result.Suggestions.ToList();
         startHints = result.StartCityHints.ToList();

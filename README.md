@@ -1,37 +1,63 @@
 # ETS2 Route Planner
 
-Blazor Server + ASP.NET Core + EF Core + SQLite app that imports ETS2 local data and ts-map exports to suggest:
+Standalone C# solution for Euro Truck Simulator 2 route cargo suggestions:
 
 `StartCompany -> CargoType -> TargetCompany`
 
-## Projects
-- `Ets2RoutePlanner.Web` (Blazor Server UI)
-- `Ets2RoutePlanner.Core` (domain models)
-- `Ets2RoutePlanner.Data` (EF Core, import, parsers, ts-map automation)
+Stack:
+- `Blazor Server` (`Ets2RoutePlanner.Web`)
+- `Domain/logic` (`Ets2RoutePlanner.Core`)
+- `EF Core + SQLite + import pipeline` (`Ets2RoutePlanner.Data`)
 
-## Run
+## Build & Run
 ```bash
 dotnet build Ets2RoutePlanner.sln
 dotnet run --project Ets2RoutePlanner.Web
 ```
 
-## Auto-detection
-The importer checks Steam library folders and app manifest `227300` and validates `def.scs` inside:
-- Windows: `C:\Program Files (x86)\Steam\...` + alternate steam roots
-- Linux/Proton: `~/.steam/steam/...` and `~/.local/share/Steam/...`
+The app applies EF Core migrations automatically on startup.
 
-If auto-detection fails, `/setup` asks for the ETS2 folder.
+## Auto Import Flow (`/setup`)
+1. Detect ETS2 path automatically.
+2. Download/verify `ts-map` from official GitHub releases referenced by `https://unicor-p.github.io/ts-map/`.
+3. Run `ts-map export`.
+4. Parse city/depot export and build `CityCompany` by nearest city (`RADIUS_KM = 25`).
+5. Parse local ETS2 `def.scs` + `dlc_*.scs` archives for cargo types + company in/out cargo rules.
+6. Reconcile ts-map aliases to ETS2 internal company keys.
+7. Save to SQLite and show summary counts.
 
-## Database location
-SQLite file is created at:
+Import runs in a hosted background service and streams live log lines to `/setup`.
+
+## ETS2 Path Auto-Detection
+Detection checks:
+- Windows Steam roots, including common fixed-drive locations.
+- `steamapps/libraryfolders.vdf` parsing.
+- ETS2 app manifest `appmanifest_227300.acf`.
+- Install folder validation by `def.scs`.
+- Linux/Proton common Steam locations.
+
+If detection fails, `/setup` shows a web folder picker (server-side browsing) so you can select the ETS2 root and rerun import.
+
+## SQLite Location
+Database file:
 - `Ets2RoutePlanner.Web/App_Data/ets2routeplanner.db`
 
-## Import troubleshooting
-- Ensure ETS2 is installed and `def.scs` exists in the selected folder.
-- Ensure internet access for ts-map release download (cached under `tools/ts-map/`).
-- If ts-map export format differs, re-run import after tool updates.
-- Use `/mapping` to resolve unmapped depots and improve suggestions.
+`Clear DB` on `/setup` deletes the SQLite file and recreates schema.
 
-## Notes
-- No proprietary game assets are downloaded from internet.
-- Re-run import is idempotent (upserts and unique constraints).
+## Mapping & Suggest
+- `/mapping`: map unmapped ts-map aliases to internal ETS2 companies (top-5 suggestions shown).
+- `/suggest`: autocomplete start/target city and compute valid intersections:
+  - start company must have `Out(cargo)`
+  - target company must have `In(cargo)`
+
+If unmapped depots still exist, `/suggest` displays a warning banner.
+
+## Troubleshooting
+- Ensure ETS2 is installed locally and contains `def.scs`.
+- Ensure internet access is available for first `ts-map` download.
+- If ts-map output format changes, rerun import (parser supports GeoJSON/JSON heuristics).
+- Use `/mapping` to reduce unmapped aliases and improve suggestion completeness.
+
+## Legal
+- The app does **not** download ETS2 proprietary assets.
+- It only reads local installed game archives (`def.scs`, `dlc_*.scs`).

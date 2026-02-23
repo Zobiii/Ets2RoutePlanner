@@ -1,19 +1,85 @@
 @page "/setup"
-@inject IImportCoordinator Importer
-@inject ImportProgress Progress
-@inject AppDbContext Db
-@using Microsoft.EntityFrameworkCore
+@implements IAsyncDisposable
+@inject IImportJobService ImportJobs
+@inject IJSRuntime Js
 
 <h3>Setup</h3>
-<button @onclick="RunImport">Full Auto Import</button>
-<button @onclick="RunImport">Re-run Import</button>
-<button @onclick="ClearDb">Clear DB</button>
-@if (needsPath)
+
+<div class="setup-actions">
+    <button class="btn btn-primary btn-lg" @onclick="StartImportAsync" disabled="@isRunning">Full Auto Import</button>
+    <button class="btn" @onclick="StartImportAsync" disabled="@isRunning">Re-run Import</button>
+    <button class="btn btn-danger" @onclick="ClearDbAsync" disabled="@isRunning">Clear DB</button>
+</div>
+
+@if (isRunning)
 {
-    <div class="warn">ETS2 path auto-detection failed. Provide ETS2 install folder.</div>
-    <input @bind="manualPath" placeholder="/path/to/Euro Truck Simulator 2" style="width:500px" />
+    <div class="info">Import is running in background...</div>
 }
+
+@if (!string.IsNullOrWhiteSpace(error))
+{
+    <div class="warn">@error</div>
+}
+
+@if (needsManualPath)
+{
+    <div class="warn">
+        Auto-detection failed. Select your extracted ETS2 folder, then click <b>Full Auto Import</b>.
+    </div>
+}
+
+<div class="picker-row">
+    <input @bind="manualPath" placeholder="Extracted ETS2 folder path (optional)" style="min-width: 460px;" />
+    <button class="btn" @onclick="UseCurrentFolder">Use Current Folder</button>
+    <button class="btn" @onclick="ValidatePathClicked">Validate Folder</button>
+</div>
+<div class="picker-roots">
+    @foreach (var root in roots)
+    {
+        <button class="btn btn-small" @onclick="() => OpenFolder(root)">@root</button>
+    }
+</div>
+@if (!string.IsNullOrWhiteSpace(browserPath))
+{
+    <div class="picker-nav">
+        <span><b>Browsing:</b> @browserPath</span>
+        <button class="btn btn-small" @onclick="GoUp">Up</button>
+    </div>
+    <div class="picker-grid">
+        @foreach (var dir in browserDirectories)
+        {
+            <button class="btn btn-small folder-btn" @onclick="() => OpenFolder(dir)">
+                @System.IO.Path.GetFileName(dir)
+            </button>
+        }
+    </div>
+}
+
+@if (validation is not null)
+{
+    <div class="@(validation.IsReady ? "info" : "warn")">
+        <div><b>Validation:</b> @validation.Path</div>
+        <ul>
+            <li>Folder exists: @(validation.Exists ? "OK" : "Missing")</li>
+            <li><code>def/</code>: @(validation.Def ? "OK" : "Missing")</li>
+            <li><code>map/</code> (optional): @(validation.Map ? "OK" : "Missing")</li>
+            <li><code>prefab/</code> (optional): @(validation.Prefab ? "OK" : "Missing")</li>
+            <li><code>material/ui/map/</code> (optional): @(validation.MaterialUiMap ? "OK" : "Missing")</li>
+            <li><code>version.sii</code> (optional): @(validation.VersionSii ? "OK" : "Missing")</li>
+        </ul>
+        @if (validation.IsReady)
+        {
+            <div>Folder looks valid for direct import.</div>
+        }
+        else
+        {
+            <div>Folder is incomplete. Finish extraction before import.</div>
+        }
+    </div>
+}
+
 <pre>@string.Join("\n", logs)</pre>
+
 @if (summary is not null)
 {
     <ul>
@@ -29,40 +95,314 @@
 @code {
     private readonly List<string> logs = [];
     private ImportSummary? summary;
-    private bool needsPath;
+    private bool isRunning;
+    private bool needsManualPath;
+    private string? error;
     private string? manualPath;
+    private string? browserPath;
+    private List<string> roots = [];
+    private List<string> browserDirectories = [];
+    private FolderValidation? validation;
+    private int logCursor;
+    private PeriodicTimer? timer;
+    private CancellationTokenSource? pollCts;
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
-        Progress.OnLog += Handle;
+        roots = DriveInfo.GetDrives()
+            .Where(d => d.IsReady && d.DriveType == DriveType.Fixed)
+            .Select(d => d.RootDirectory.FullName)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        browserPath = roots.FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(browserPath))
+        {
+            LoadDirectories(browserPath);
+        }
+
+        await RefreshStatusAsync();
+
+        pollCts = new CancellationTokenSource();
+        timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        _ = PollAsync(pollCts.Token);
     }
 
-    private void Handle(string message)
-    {
-        logs.Add(message);
-        InvokeAsync(StateHasChanged);
-    }
-
-    private async Task RunImport()
+    private async Task PollAsync(CancellationToken token)
     {
         try
         {
-            summary = await Importer.RunFullImportAsync(needsPath ? manualPath : null);
-            needsPath = false;
+            while (timer is not null && await timer.WaitForNextTickAsync(token))
+            {
+                await RefreshStatusAsync();
+                await InvokeAsync(StateHasChanged);
+            }
         }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("not detected", StringComparison.OrdinalIgnoreCase))
+        catch (OperationCanceledException)
         {
-            needsPath = true;
-            logs.Add(ex.Message);
         }
     }
 
-    private async Task ClearDb()
+    private async Task RefreshStatusAsync()
     {
-        await Importer.ClearDatabaseAsync();
-        logs.Add("Database cleared");
-        summary = null;
+        var status = ImportJobs.GetStatus(logCursor);
+        isRunning = status.IsRunning;
+        needsManualPath = status.NeedsManualPath;
+        error = status.Error;
+        summary = status.Summary;
+
+        logCursor = status.Logs.NextCursor;
+        if (status.Logs.Lines.Count > 0)
+        {
+            logs.AddRange(status.Logs.Lines);
+            if (logs.Count > 2000)
+            {
+                logs.RemoveRange(0, logs.Count - 2000);
+            }
+        }
     }
 
-    public void Dispose() => Progress.OnLog -= Handle;
+    private async Task StartImportAsync()
+    {
+        var path = string.IsNullOrWhiteSpace(manualPath) ? null : NormalizePathInput(manualPath);
+        if (!string.IsNullOrWhiteSpace(path) && !ValidateManualPath())
+        {
+            logs.Add($"[{DateTime.Now:HH:mm:ss}] Validation failed. Import not started.");
+            return;
+        }
+
+        var start = await ImportJobs.StartFullImportAsync(path);
+        logs.Add($"[{DateTime.Now:HH:mm:ss}] {start.Message}");
+        await RefreshStatusAsync();
+    }
+
+    private async Task ClearDbAsync()
+    {
+        var confirmed = await Js.InvokeAsync<bool>("confirm", "Delete SQLite DB file and all imported data?");
+        if (!confirmed)
+        {
+            return;
+        }
+
+        await ImportJobs.ClearDatabaseAsync();
+        summary = null;
+        error = null;
+        logCursor = 0;
+        logs.Clear();
+        await RefreshStatusAsync();
+    }
+
+    private void OpenFolder(string folder)
+    {
+        browserPath = folder;
+        LoadDirectories(folder);
+    }
+
+    private void GoUp()
+    {
+        if (string.IsNullOrWhiteSpace(browserPath))
+        {
+            return;
+        }
+
+        var parent = Directory.GetParent(browserPath);
+        if (parent is null)
+        {
+            return;
+        }
+
+        browserPath = parent.FullName;
+        LoadDirectories(browserPath);
+    }
+
+    private void UseCurrentFolder()
+    {
+        if (!string.IsNullOrWhiteSpace(browserPath))
+        {
+            manualPath = browserPath;
+            ValidateManualPath();
+        }
+    }
+
+    private void ValidatePathClicked()
+    {
+        if (ValidateManualPath())
+        {
+            logs.Add($"[{DateTime.Now:HH:mm:ss}] Validation OK.");
+        }
+        else
+        {
+            logs.Add($"[{DateTime.Now:HH:mm:ss}] Validation failed.");
+        }
+    }
+
+    private bool ValidateManualPath()
+    {
+        var path = NormalizePathInput(manualPath);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            validation = null;
+            return false;
+        }
+
+        var exists = Directory.Exists(path);
+        var def = exists && DirectoryExistsAny(path,
+            "def",
+            Path.Combine("def", "def"),
+            Path.Combine("base", "def"),
+            Path.Combine("base_share", "def"));
+
+        var map = exists && DirectoryExistsAny(path,
+            "map",
+            Path.Combine("base_map", "map"),
+            Path.Combine("base", "map"));
+
+        var prefab = exists && (DirectoryExistsAny(path,
+            "prefab",
+            Path.Combine("base", "prefab"),
+            Path.Combine("base_share", "prefab"),
+            Path.Combine("base_vehicle", "prefab"),
+            Path.Combine("base_map", "prefab"))
+            || DirectoryExistsByName(path, "prefab", maxDepth: 4));
+
+        var materialUiMap = exists && DirectoryExistsAny(path,
+            Path.Combine("material", "ui", "map"),
+            Path.Combine("base", "material", "ui", "map"),
+            Path.Combine("base_share", "material", "ui", "map"));
+
+        var versionSii = exists && FileExistsAny(path,
+            "version.sii",
+            Path.Combine("base", "version.sii"),
+            Path.Combine("base_share", "version.sii"));
+
+        validation = new FolderValidation(path, exists, def, map, prefab, materialUiMap, versionSii);
+        return validation.IsReady;
+    }
+
+    private static bool DirectoryExistsAny(string root, params string[] relativeCandidates)
+    {
+        foreach (var relative in relativeCandidates)
+        {
+            if (Directory.Exists(Path.Combine(root, relative)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool FileExistsAny(string root, params string[] relativeCandidates)
+    {
+        foreach (var relative in relativeCandidates)
+        {
+            if (File.Exists(Path.Combine(root, relative)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool DirectoryExistsByName(string root, string name, int maxDepth)
+    {
+        if (!Directory.Exists(root))
+        {
+            return false;
+        }
+
+        var pending = new Queue<(string Dir, int Depth)>();
+        pending.Enqueue((root, 0));
+
+        while (pending.Count > 0)
+        {
+            var (current, depth) = pending.Dequeue();
+            if (depth > maxDepth)
+            {
+                continue;
+            }
+
+            string[] children;
+            try
+            {
+                children = Directory.GetDirectories(current);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var child in children)
+            {
+                if (string.Equals(Path.GetFileName(child), name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                pending.Enqueue((child, depth + 1));
+            }
+        }
+
+        return false;
+    }
+
+    private static string? NormalizePathInput(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = value.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(normalized);
+        }
+        catch
+        {
+            return normalized;
+        }
+    }
+
+    private void LoadDirectories(string folder)
+    {
+        try
+        {
+            browserDirectories = Directory.GetDirectories(folder)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .Take(300)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            browserDirectories = [];
+            logs.Add($"[{DateTime.Now:HH:mm:ss}] Folder browse warning: {ex.Message}");
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        pollCts?.Cancel();
+        timer?.Dispose();
+        pollCts?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    private sealed record FolderValidation(
+        string Path,
+        bool Exists,
+        bool Def,
+        bool Map,
+        bool Prefab,
+        bool MaterialUiMap,
+        bool VersionSii)
+    {
+        public bool IsReady => Exists && Def;
+    }
 }

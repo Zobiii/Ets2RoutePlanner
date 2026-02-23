@@ -3,77 +3,256 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Ets2RoutePlanner.Data;
 
-public class RecommendationService(AppDbContext db) : IRecommendationService
+public sealed class RecommendationService(AppDbContext db) : IRecommendationService
 {
     public async Task<SuggestionResult> SuggestAsync(string startCityName, string targetCityName, CancellationToken ct = default)
     {
-        var cities = await db.Cities.ToListAsync(ct);
-        var start = cities.FirstOrDefault(c => c.Name.Equals(startCityName, StringComparison.OrdinalIgnoreCase));
-        var end = cities.FirstOrDefault(c => c.Name.Equals(targetCityName, StringComparison.OrdinalIgnoreCase));
-        if (start is null || end is null)
+        var cities = await db.Cities
+            .AsNoTracking()
+            .OrderBy(c => c.Name)
+            .ToListAsync(ct);
+
+        var start = ResolveCity(cities, startCityName);
+        var target = ResolveCity(cities, targetCityName);
+
+        if (start is null || target is null)
         {
-            var startHints = cities.Select(c => c.Name).OrderBy(n => Fuzzy.Score(startCityName.ToLowerInvariant(), n.ToLowerInvariant())).TakeLast(5).ToList();
-            var targetHints = cities.Select(c => c.Name).OrderBy(n => Fuzzy.Score(targetCityName.ToLowerInvariant(), n.ToLowerInvariant())).TakeLast(5).ToList();
-            return new SuggestionResult([], startHints, targetHints);
+            return new SuggestionResult(
+                [],
+                BuildCityHints(cities, startCityName),
+                BuildCityHints(cities, targetCityName));
         }
 
-        var startCompanies = await db.CityCompanies.Where(x => x.CityId == start.Id).Select(x => x.CompanyId).ToListAsync(ct);
-        var endCompanies = await db.CityCompanies.Where(x => x.CityId == end.Id).Select(x => x.CompanyId).ToListAsync(ct);
-        var rules = await db.CompanyCargoRules.Include(x => x.CargoType).ToListAsync(ct);
-        var companies = await db.Companies.ToDictionaryAsync(x => x.Id, ct);
-        var suggestions = new HashSet<RouteSuggestion>();
-        foreach (var sc in startCompanies)
+        var startCompanyIds = await db.CityCompanies
+            .AsNoTracking()
+            .Where(x => x.CityId == start.Id)
+            .Select(x => x.CompanyId)
+            .Distinct()
+            .ToListAsync(ct);
+
+        var targetCompanyIds = await db.CityCompanies
+            .AsNoTracking()
+            .Where(x => x.CityId == target.Id)
+            .Select(x => x.CompanyId)
+            .Distinct()
+            .ToListAsync(ct);
+
+        if (startCompanyIds.Count == 0 || targetCompanyIds.Count == 0)
         {
-            var outC = rules.Where(r => r.CompanyId == sc && r.Direction == CargoDirection.Out).ToDictionary(r => r.CargoTypeId);
-            foreach (var ec in endCompanies)
+            return new SuggestionResult([], [], []);
+        }
+
+        var involvedCompanyIds = startCompanyIds
+            .Concat(targetCompanyIds)
+            .Distinct()
+            .ToList();
+
+        var rules = await db.CompanyCargoRules
+            .AsNoTracking()
+            .Include(r => r.CargoType)
+            .Where(r => involvedCompanyIds.Contains(r.CompanyId))
+            .ToListAsync(ct);
+
+        var companies = await db.Companies
+            .AsNoTracking()
+            .Where(c => involvedCompanyIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, ct);
+
+        var outRulesByCompany = rules
+            .Where(r => r.Direction == CargoDirection.Out)
+            .GroupBy(r => r.CompanyId)
+            .ToDictionary(g => g.Key, g => g.ToDictionary(r => r.CargoTypeId));
+
+        var inRulesByCompany = rules
+            .Where(r => r.Direction == CargoDirection.In)
+            .GroupBy(r => r.CompanyId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var suggestions = new HashSet<RouteSuggestion>();
+
+        foreach (var startCompanyId in startCompanyIds)
+        {
+            if (!outRulesByCompany.TryGetValue(startCompanyId, out var outRules))
             {
-                foreach (var inc in rules.Where(r => r.CompanyId == ec && r.Direction == CargoDirection.In))
+                continue;
+            }
+
+            foreach (var targetCompanyId in targetCompanyIds)
+            {
+                if (!inRulesByCompany.TryGetValue(targetCompanyId, out var inRules))
                 {
-                    if (!outC.TryGetValue(inc.CargoTypeId, out var outRule)) continue;
-                    suggestions.Add(new RouteSuggestion(companies[sc].DisplayName ?? companies[sc].Key, inc.CargoType?.DisplayName ?? inc.CargoType?.Key ?? outRule.CargoType?.Key ?? "", companies[ec].DisplayName ?? companies[ec].Key));
+                    continue;
+                }
+
+                foreach (var inRule in inRules)
+                {
+                    if (!outRules.TryGetValue(inRule.CargoTypeId, out var outRule))
+                    {
+                        continue;
+                    }
+
+                    var startCompany = companies[startCompanyId].DisplayName ?? companies[startCompanyId].Key;
+                    var cargo = inRule.CargoType?.DisplayName ?? outRule.CargoType?.DisplayName ?? inRule.CargoType?.Key ?? outRule.CargoType?.Key ?? string.Empty;
+                    var targetCompany = companies[targetCompanyId].DisplayName ?? companies[targetCompanyId].Key;
+
+                    suggestions.Add(new RouteSuggestion(startCompany, cargo, targetCompany));
                 }
             }
         }
-        var sorted = suggestions.OrderBy(x => x.StartCompany).ThenBy(x => x.CargoType).ThenBy(x => x.TargetCompany).ToList();
-        return new SuggestionResult(sorted, [], []);
+
+        var ordered = suggestions
+            .OrderBy(s => s.StartCompany, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(s => s.CargoType, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(s => s.TargetCompany, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return new SuggestionResult(ordered, [], []);
+    }
+
+    private static City? ResolveCity(List<City> cities, string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return null;
+        }
+
+        var exact = cities.FirstOrDefault(c => c.Name.Equals(input.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (exact is not null)
+        {
+            return exact;
+        }
+
+        var best = cities
+            .Select(c => new { City = c, Score = Fuzzy.Score(input, c.Name) })
+            .OrderByDescending(x => x.Score)
+            .FirstOrDefault();
+
+        return best is { Score: >= 0.92 } ? best.City : null;
+    }
+
+    private static IReadOnlyList<string> BuildCityHints(List<City> cities, string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return [];
+        }
+
+        return cities
+            .Select(c => new { c.Name, Score = Fuzzy.Score(input, c.Name) })
+            .OrderByDescending(x => x.Score)
+            .Take(5)
+            .Select(x => x.Name)
+            .ToList();
     }
 }
 
 public record MappingSuggestion(string AliasKey, string DisplayName, IReadOnlyList<string> Candidates);
+
 public interface ICompanyMappingService
 {
     Task<IReadOnlyList<MappingSuggestion>> GetUnmappedAsync(CancellationToken ct = default);
     Task ApplyMappingAsync(string aliasKey, int targetCompanyId, CancellationToken ct = default);
 }
 
-public class CompanyMappingService(AppDbContext db) : ICompanyMappingService
+public sealed class CompanyMappingService(AppDbContext db) : ICompanyMappingService
 {
     public async Task<IReadOnlyList<MappingSuggestion>> GetUnmappedAsync(CancellationToken ct = default)
     {
-        var companies = await db.Companies.ToListAsync(ct);
-        var mapped = companies.Where(x => !x.IsUnmapped).ToList();
-        return companies.Where(x => x.IsUnmapped).Select(u => new MappingSuggestion(
-            u.Key,
-            u.DisplayName ?? u.Key,
-            mapped.Select(m => new { m.Key, Score = Fuzzy.Score(CompanyNormalizer.Simplify(u.Key), CompanyNormalizer.Simplify(m.Key)) })
-                .OrderByDescending(x => x.Score).Take(5).Select(x => x.Key).ToList()
-        )).ToList();
+        var companies = await db.Companies
+            .AsNoTracking()
+            .OrderBy(c => c.Key)
+            .ToListAsync(ct);
+
+        var mapped = companies.Where(c => !c.IsUnmapped).ToList();
+        var unmapped = companies.Where(c => c.IsUnmapped).ToList();
+
+        return unmapped.Select(u =>
+            new MappingSuggestion(
+                u.Key,
+                u.DisplayName ?? u.Key,
+                mapped
+                    .Select(m => new { m.Key, Score = Fuzzy.Score(CompanyNormalizer.Simplify(u.Key), CompanyNormalizer.Simplify(m.Key)) })
+                    .OrderByDescending(x => x.Score)
+                    .Take(5)
+                    .Select(x => x.Key)
+                    .ToList()))
+            .ToList();
     }
 
     public async Task ApplyMappingAsync(string aliasKey, int targetCompanyId, CancellationToken ct = default)
     {
-        var source = await db.Companies.FirstAsync(x => x.Key == aliasKey, ct);
-        if (!await db.CompanyAliases.AnyAsync(x => x.AliasKey == aliasKey, ct))
-            db.CompanyAliases.Add(new CompanyAlias { AliasKey = aliasKey, CompanyId = targetCompanyId, Source = "manual" });
+        var target = await db.Companies.FirstOrDefaultAsync(c => c.Id == targetCompanyId, ct)
+            ?? throw new InvalidOperationException("Target company not found.");
 
-        var links = await db.CityCompanies.Where(x => x.CompanyId == source.Id).ToListAsync(ct);
-        foreach (var l in links)
+        var alias = await db.CompanyAliases.FirstOrDefaultAsync(a => a.AliasKey == aliasKey, ct);
+        Company? sourceCompany = null;
+
+        if (alias is null)
         {
-            if (!await db.CityCompanies.AnyAsync(x => x.CityId == l.CityId && x.CompanyId == targetCompanyId, ct))
-                db.CityCompanies.Add(new CityCompany { CityId = l.CityId, CompanyId = targetCompanyId, Source = CityCompanySource.Manual });
-            db.CityCompanies.Remove(l);
+            sourceCompany = await db.Companies.FirstOrDefaultAsync(c => c.Key == aliasKey, ct);
+            if (sourceCompany is null)
+            {
+                throw new InvalidOperationException("Alias source company not found.");
+            }
+
+            alias = new CompanyAlias
+            {
+                AliasKey = aliasKey,
+                CompanyId = targetCompanyId,
+                Source = "manual"
+            };
+            db.CompanyAliases.Add(alias);
         }
-        db.Companies.Remove(source);
+        else
+        {
+            sourceCompany = await db.Companies.FirstOrDefaultAsync(c => c.Id == alias.CompanyId, ct);
+            alias.CompanyId = targetCompanyId;
+            alias.Source = "manual";
+        }
+
+        if (sourceCompany is not null && sourceCompany.Id != targetCompanyId)
+        {
+            var cityLinks = await db.CityCompanies
+                .Where(x => x.CompanyId == sourceCompany.Id)
+                .ToListAsync(ct);
+
+            foreach (var link in cityLinks)
+            {
+                var exists = await db.CityCompanies.AnyAsync(
+                    x => x.CityId == link.CityId && x.CompanyId == targetCompanyId,
+                    ct);
+
+                if (!exists)
+                {
+                    db.CityCompanies.Add(new CityCompany
+                    {
+                        CityId = link.CityId,
+                        CompanyId = targetCompanyId,
+                        Source = CityCompanySource.Manual
+                    });
+                }
+
+                db.CityCompanies.Remove(link);
+            }
+
+            var sourceAliases = await db.CompanyAliases
+                .Where(a => a.CompanyId == sourceCompany.Id)
+                .ToListAsync(ct);
+
+            foreach (var sourceAlias in sourceAliases)
+            {
+                sourceAlias.CompanyId = targetCompanyId;
+                sourceAlias.Source = "manual";
+            }
+
+            var hasRules = await db.CompanyCargoRules.AnyAsync(r => r.CompanyId == sourceCompany.Id, ct);
+            if (!hasRules)
+            {
+                db.Companies.Remove(sourceCompany);
+            }
+        }
+
+        target.IsUnmapped = false;
         await db.SaveChangesAsync(ct);
     }
 }
