@@ -1,0 +1,49 @@
+@page "/suggest"
+@inject IRecommendationService Service
+@inject AppDbContext Db
+@using Microsoft.EntityFrameworkCore
+
+<h3>Suggest Routes</h3>
+@if (hasUnmapped) { <div class="warn">Some depots are unmapped; results may be incomplete.</div> }
+<div>
+    <input list="cities" @bind="start" placeholder="StartCity" />
+    <input list="cities" @bind="target" placeholder="TargetCity" />
+    <datalist id="cities">
+        @foreach (var c in cities) { <option value="@c"/> }
+    </datalist>
+    <button @onclick="Suggest">Suggest</button>
+</div>
+@if (startHints.Count > 0 || targetHints.Count > 0)
+{
+    <div class="warn">City not found. Start hints: @string.Join(",", startHints) | Target hints: @string.Join(",", targetHints)</div>
+}
+<table>
+<thead><tr><th>StartCompany</th><th>CargoType</th><th>TargetCompany</th></tr></thead>
+<tbody>
+@foreach (var r in rows) { <tr><td>@r.StartCompany</td><td>@r.CargoType</td><td>@r.TargetCompany</td></tr> }
+</tbody>
+</table>
+
+@code {
+    private string start = string.Empty;
+    private string target = string.Empty;
+    private List<string> cities = [];
+    private List<RouteSuggestion> rows = [];
+    private List<string> startHints = [];
+    private List<string> targetHints = [];
+    private bool hasUnmapped;
+
+    protected override async Task OnInitializedAsync()
+    {
+        cities = await Db.Cities.Select(x => x.Name).OrderBy(x => x).ToListAsync();
+        hasUnmapped = await Db.Companies.AnyAsync(x => x.IsUnmapped);
+    }
+
+    private async Task Suggest()
+    {
+        var result = await Service.SuggestAsync(start, target);
+        rows = result.Suggestions.ToList();
+        startHints = result.StartCityHints.ToList();
+        targetHints = result.TargetCityHints.ToList();
+    }
+}

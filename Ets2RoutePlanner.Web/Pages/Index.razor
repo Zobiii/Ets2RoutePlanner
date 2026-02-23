@@ -1,0 +1,2 @@
+@page "/"
+@code { protected override void OnInitialized() => Nav.NavigateTo("/setup", true); [Inject] NavigationManager Nav { get; set; } = default!; }
