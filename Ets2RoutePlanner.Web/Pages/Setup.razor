@@ -1,0 +1,68 @@
+@page "/setup"
+@inject IImportCoordinator Importer
+@inject ImportProgress Progress
+@inject AppDbContext Db
+@using Microsoft.EntityFrameworkCore
+
+<h3>Setup</h3>
+<button @onclick="RunImport">Full Auto Import</button>
+<button @onclick="RunImport">Re-run Import</button>
+<button @onclick="ClearDb">Clear DB</button>
+@if (needsPath)
+{
+    <div class="warn">ETS2 path auto-detection failed. Provide ETS2 install folder.</div>
+    <input @bind="manualPath" placeholder="/path/to/Euro Truck Simulator 2" style="width:500px" />
+}
+<pre>@string.Join("\n", logs)</pre>
+@if (summary is not null)
+{
+    <ul>
+        <li>Cities: @summary.Cities</li>
+        <li>Companies: @summary.Companies</li>
+        <li>CityCompanies: @summary.CityCompanies</li>
+        <li>CargoTypes: @summary.CargoTypes</li>
+        <li>Rules: @summary.Rules</li>
+        <li>UnmappedCompanies: @summary.UnmappedCompanies</li>
+    </ul>
+}
+
+@code {
+    private readonly List<string> logs = [];
+    private ImportSummary? summary;
+    private bool needsPath;
+    private string? manualPath;
+
+    protected override void OnInitialized()
+    {
+        Progress.OnLog += Handle;
+    }
+
+    private void Handle(string message)
+    {
+        logs.Add(message);
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task RunImport()
+    {
+        try
+        {
+            summary = await Importer.RunFullImportAsync(needsPath ? manualPath : null);
+            needsPath = false;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("not detected", StringComparison.OrdinalIgnoreCase))
+        {
+            needsPath = true;
+            logs.Add(ex.Message);
+        }
+    }
+
+    private async Task ClearDb()
+    {
+        await Importer.ClearDatabaseAsync();
+        logs.Add("Database cleared");
+        summary = null;
+    }
+
+    public void Dispose() => Progress.OnLog -= Handle;
+}

@@ -1,0 +1,49 @@
+@page "/mapping"
+@inject ICompanyMappingService MappingService
+@inject AppDbContext Db
+@using Microsoft.EntityFrameworkCore
+
+<h3>Company Mapping</h3>
+@if (items.Count == 0) { <p>No unmapped companies.</p> }
+else
+{
+<table>
+    <thead><tr><th>Display</th><th>AliasKey</th><th>Suggested</th><th>Map To</th></tr></thead>
+    <tbody>
+    @foreach (var item in items)
+    {
+        <tr>
+            <td>@item.DisplayName</td>
+            <td>@item.AliasKey</td>
+            <td>@string.Join(", ", item.Candidates)</td>
+            <td>
+                <select @onchange="(e)=> selected[item.AliasKey] = e.Value?.ToString() ?? \"\"">
+                    <option value="">--select--</option>
+                    @foreach (var c in companies) { <option value="@c.Id">@c.Key</option> }
+                </select>
+                <button @onclick="()=>Apply(item.AliasKey)">Apply</button>
+            </td>
+        </tr>
+    }
+    </tbody>
+</table>
+}
+
+@code {
+    private List<MappingSuggestion> items = [];
+    private List<Company> companies = [];
+    private Dictionary<string, string> selected = [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        items = (await MappingService.GetUnmappedAsync()).ToList();
+        companies = await Db.Companies.Where(x => !x.IsUnmapped).OrderBy(x => x.Key).ToListAsync();
+    }
+
+    private async Task Apply(string alias)
+    {
+        if (!selected.TryGetValue(alias, out var raw) || !int.TryParse(raw, out var id)) return;
+        await MappingService.ApplyMappingAsync(alias, id);
+        items = (await MappingService.GetUnmappedAsync()).ToList();
+    }
+}
