@@ -1,63 +1,55 @@
 # ETS2 Route Planner
 
-Standalone C# solution for Euro Truck Simulator 2 route cargo suggestions:
+Standalone C# solution for Euro Truck Simulator 2 cargo route suggestions:
 
 `StartCompany -> CargoType -> TargetCompany`
 
-Stack:
-- `Blazor Server` (`Ets2RoutePlanner.Web`)
-- `Domain/logic` (`Ets2RoutePlanner.Core`)
-- `EF Core + SQLite + import pipeline` (`Ets2RoutePlanner.Data`)
+## Projects
+- `Ets2RoutePlanner.Web`: Blazor Server UI
+- `Ets2RoutePlanner.Core`: domain model and contracts
+- `Ets2RoutePlanner.Data`: EF Core (SQLite), import pipeline, matching logic
 
-## Build & Run
+## Requirements
+- .NET 8 SDK
+- An extracted ETS2 data folder that contains at least `def/`
+  - The current importer reads extracted folders directly.
+  - It does not depend on downloading external map tools.
+
+## Build and Run
 ```bash
 dotnet build Ets2RoutePlanner.sln
 dotnet run --project Ets2RoutePlanner.Web
 ```
 
-The app applies EF Core migrations automatically on startup.
+On startup, the app:
+1. Creates `Ets2RoutePlanner.Web/App_Data` if missing.
+2. Applies EF Core migrations.
+3. Ensures required SQLite tables and indexes exist.
 
-## Auto Import Flow (`/setup`)
-1. Detect ETS2 path automatically.
-2. Download/verify `ts-map` from official GitHub releases referenced by `https://unicor-p.github.io/ts-map/`.
-3. Run `ts-map export`.
-4. Parse city/depot export and build `CityCompany` by nearest city (`RADIUS_KM = 25`).
-5. Parse local ETS2 `def.scs` + `dlc_*.scs` archives for cargo types + company in/out cargo rules.
-6. Reconcile ts-map aliases to ETS2 internal company keys.
-7. Save to SQLite and show summary counts.
+## First Import Workflow (`/setup`)
+1. Open `/setup` (default start page redirects there).
+2. Click `Full Auto Import`.
+3. If auto-detection fails, select your extracted ETS2 folder in the built-in folder browser, then click `Use Current Folder`.
+4. Optional: click `Validate Folder` before importing.
+5. Watch live import logs and summary counts in the same page.
 
-Import runs in a hosted background service and streams live log lines to `/setup`.
+`Clear DB` removes the current SQLite database and recreates schema.
 
-## ETS2 Path Auto-Detection
-Detection checks:
-- Windows Steam roots, including common fixed-drive locations.
-- `steamapps/libraryfolders.vdf` parsing.
-- ETS2 app manifest `appmanifest_227300.acf`.
-- Install folder validation by `def.scs`.
-- Linux/Proton common Steam locations.
+## Pages
+- `/setup`: run import, validate folder path, clear database, view live logs
+- `/mapping`: map unmapped company aliases to known ETS2 companies (top-5 suggestions)
+- `/suggest`: enter start and target city, then compute compatible cargo routes
 
-If detection fails, `/setup` shows a web folder picker (server-side browsing) so you can select the ETS2 root and rerun import.
+If unmapped companies remain, `/suggest` shows a warning that results can be incomplete.
 
 ## SQLite Location
-Database file:
 - `Ets2RoutePlanner.Web/App_Data/ets2routeplanner.db`
 
-`Clear DB` on `/setup` deletes the SQLite file and recreates schema.
-
-## Mapping & Suggest
-- `/mapping`: map unmapped ts-map aliases to internal ETS2 companies (top-5 suggestions shown).
-- `/suggest`: autocomplete start/target city and compute valid intersections:
-  - start company must have `Out(cargo)`
-  - target company must have `In(cargo)`
-
-If unmapped depots still exist, `/suggest` displays a warning banner.
-
 ## Troubleshooting
-- Ensure ETS2 is installed locally and contains `def.scs`.
-- Ensure internet access is available for first `ts-map` download.
-- If ts-map output format changes, rerun import (parser supports GeoJSON/JSON heuristics).
-- Use `/mapping` to reduce unmapped aliases and improve suggestion completeness.
+- If import fails, verify the selected folder includes `def/`.
+- If auto-detection cannot find ETS2, choose the folder manually on `/setup`.
+- Use `/mapping` after import to resolve aliases and improve route quality.
 
 ## Legal
-- The app does **not** download ETS2 proprietary assets.
-- It only reads local installed game archives (`def.scs`, `dlc_*.scs`).
+- The app does not download ETS2 proprietary assets.
+- It reads local, user-provided extracted ETS2 data only.
